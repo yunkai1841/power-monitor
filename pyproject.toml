@@ -1,0 +1,10 @@
+[project]
+name = "power-monitor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "psutil>=5.9.0",
+    "pynvml>=11.5.0",
+]

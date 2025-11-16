@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+import os
+import time
+import argparse
+import csv
+import json
+import subprocess
+from typing import List, Dict, Optional, Any
+
+import psutil
+try:
+    from pynvml import nvmlInit, nvmlShutdown, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex, \
+        nvmlDeviceGetPowerUsage, nvmlDeviceGetName, nvmlDeviceGetUtilizationRates, \
+        nvmlDeviceGetMemoryInfo, nvmlSystemGetDriverVersion, nvmlDeviceGetGraphicsRunningProcesses_v3
+    NVML_AVAILABLE = True
+except Exception:
+    NVML_AVAILABLE = False
+
+RAPL_PATH = '/sys/class/powercap'
+
+class RaplDomain:
+    def __init__(self, path: str, name: str):
+        self.path = path
+        self.name = name
+        self.last_energy_uj: Optional[int] = None
+        self.last_timestamp: Optional[float] = None
+
+    def read_energy_uj(self) -> Optional[int]:
+        try:
+            with open(os.path.join(self.path, 'energy_uj'), 'r') as f:
+                return int(f.read().strip())
+        except Exception:
+            return None
+
+    def sample_power_w(self) -> Optional[float]:
+        energy = self.read_energy_uj()
+        now = time.time()
+        if energy is None:
+            return None
+        if self.last_energy_uj is None:
+            self.last_energy_uj = energy
+            self.last_timestamp = now
+            return None
+        delta_e = energy - self.last_energy_uj
+        delta_t = now - self.last_timestamp if self.last_timestamp else 0
+        self.last_energy_uj = energy
+        self.last_timestamp = now
+        if delta_t <= 0:
+            return None
+        return (delta_e / 1_000_000.0) / delta_t
+
+def discover_rapl_domains() -> List[RaplDomain]:
+    domains: List[RaplDomain] = []
+    if not os.path.isdir(RAPL_PATH):
+        return domains
+    for entry in os.listdir(RAPL_PATH):
+        if entry.startswith('intel-rapl'):
+            domain_path = os.path.join(RAPL_PATH, entry)
+            name_file = os.path.join(domain_path, 'name')
+            name = entry
+            if os.path.isfile(name_file):
+                try:
+                    with open(name_file, 'r') as f:
+                        name = f.read().strip()
+                except Exception:
+                    pass
+            domains.append(RaplDomain(domain_path, name))
+    return domains
+
+class GpuDevice:
+    def __init__(self, index: int, handle: Any, name: str):
+        self.index = index
+        self.handle = handle
+        self.name = name
+
+def init_nvml_devices() -> List[GpuDevice]:
+    devices: List[GpuDevice] = []
+    if not NVML_AVAILABLE:
+        return devices
+    try:
+        nvmlInit()
+        count = nvmlDeviceGetCount()
+        for i in range(count):
+            h = nvmlDeviceGetHandleByIndex(i)
+            name = nvmlDeviceGetName(h).decode('utf-8') if isinstance(nvmlDeviceGetName(h), bytes) else nvmlDeviceGetName(h)
+            devices.append(GpuDevice(i, h, name))
+    except Exception:
+        return []
+    return devices
+
+def sample_gpu_power(dev: GpuDevice) -> Optional[float]:
+    try:
+        # milliwatts -> watts
+        return nvmlDeviceGetPowerUsage(dev.handle) / 1000.0
+    except Exception:
+        return None
+
+def sample_gpu_util(dev: GpuDevice) -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    try:
+        util = nvmlDeviceGetUtilizationRates(dev.handle)
+        mem = nvmlDeviceGetMemoryInfo(dev.handle)
+        data['gpu_util_percent'] = util.gpu
+        data['mem_util_percent'] = util.memory
+        data['mem_used_mb'] = mem.used / (1024*1024)
+        data['mem_total_mb'] = mem.total / (1024*1024)
+        return data
+    except Exception:
+        return data
+
+def sample_gpu_process_util(dev: GpuDevice, target_pid: int) -> Optional[Dict[str, Any]]:
+    try:
+        procs = nvmlDeviceGetGraphicsRunningProcesses_v3(dev.handle)
+        for p in procs:
+            if p.pid == target_pid:
+                return {
+                    'gpu_proc_mem_used_mb': p.usedGpuMemory / (1024*1024)
+                }
+    except Exception:
+        return None
+    return None
+
+def format_row(row: Dict[str, Any], fmt: str) -> str:
+    if fmt == 'jsonl':
+        return json.dumps(row, ensure_ascii=False)
+    # csv -> we output header separately; here join values
+    return ','.join(str(row.get(k, '')) for k in row.keys())
+
+def write_csv_header(writer: csv.writer, keys: List[str]):
+    writer.writerow(keys)
+
+def run_command(command: List[str]) -> subprocess.Popen:
+    return subprocess.Popen(command)
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description='Intel CPU (RAPL) + NVIDIA GPU 電力・性能モニタ')
+    p.add_argument('--interval', type=float, default=1.0, help='サンプリング間隔(秒)')
+    p.add_argument('--duration', type=float, default=0.0, help='総測定時間(秒, 0=無限)')
+    p.add_argument('--output', type=str, default='', help='出力ファイルパス(空なら標準出力)')
+    p.add_argument('--format', choices=['csv','jsonl'], default='csv', help='出力フォーマット')
+    p.add_argument('--command', type=str, nargs=argparse.REMAINDER, help='監視しながら実行する外部コマンド ("--" の後に記述)')
+    p.add_argument('--pid', type=int, default=0, help='既存プロセスPIDを監視 (command未指定時)')
+    p.add_argument('--no-gpu', action='store_true', help='GPU計測を無効化')
+    p.add_argument('--no-cpu', action='store_true', help='CPU(RAPL)計測を無効化')
+    return p
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    rapl_domains = discover_rapl_domains() if not args.no_cpu else []
+    gpu_devices = init_nvml_devices() if (not args.no_gpu and NVML_AVAILABLE) else []
+
+    target_process: Optional[psutil.Process] = None
+    popen: Optional[subprocess.Popen] = None
+    if args.command:
+        # Strip leading -- if present in REMAINDER
+        cmd = args.command
+        if cmd and cmd[0] == '--':
+            cmd = cmd[1:]
+        if not cmd:
+            print('外部コマンドが指定されていません')
+            return
+        popen = run_command(cmd)
+        target_process = psutil.Process(popen.pid)
+    elif args.pid:
+        try:
+            target_process = psutil.Process(args.pid)
+        except Exception:
+            print(f'PID {args.pid} にアクセスできません')
+
+    start_time = time.time()
+    csv_writer = None
+    file_handle = None
+    keys_order: List[str] = []
+
+    if args.output:
+        mode = 'w'
+        file_handle = open(args.output, mode, buffering=1)
+        if args.format == 'csv':
+            csv_writer = csv.writer(file_handle)
+
+    print('開始: interval=%.3fs format=%s' % (args.interval, args.format))
+    if rapl_domains:
+        print('RAPL domains: ' + ', '.join(d.name for d in rapl_domains))
+    if gpu_devices:
+        try:
+            drv = nvmlSystemGetDriverVersion().decode()
+        except Exception:
+            drv = 'unknown'
+        print('NVIDIA GPUs: ' + ', '.join(f'{g.index}:{g.name}' for g in gpu_devices) + f' (driver {drv})')
+    elif not args.no_gpu and not NVML_AVAILABLE:
+        print('pynvml が利用できないため GPU 計測無効')
+
+    header_printed = False
+    try:
+        while True:
+            ts = time.time()
+            elapsed = ts - start_time
+            if args.duration and elapsed >= args.duration:
+                break
+            row: Dict[str, Any] = {'timestamp': ts}
+
+            # CPU power
+            for d in rapl_domains:
+                pw = d.sample_power_w()
+                if pw is not None:
+                    row[f'cpu_{d.name}_power_w'] = round(pw, 3)
+
+            # GPU metrics
+            for g in gpu_devices:
+                gpw = sample_gpu_power(g)
+                if gpw is not None:
+                    row[f'gpu{g.index}_power_w'] = round(gpw, 1)
+                util = sample_gpu_util(g)
+                for k,v in util.items():
+                    row[f'gpu{g.index}_{k}'] = v
+                if target_process:
+                    proc_util = sample_gpu_process_util(g, target_process.pid)
+                    if proc_util:
+                        for k,v in proc_util.items():
+                            row[f'gpu{g.index}_{k}'] = v
+
+            # Process performance
+            if target_process:
+                try:
+                    cpu_pct = target_process.cpu_percent(interval=None)  # non-blocking, delta since last call
+                    mem_info = target_process.memory_info()
+                    row['proc_cpu_percent'] = cpu_pct
+                    row['proc_mem_rss_mb'] = mem_info.rss / (1024*1024)
+                except Exception:
+                    row['proc_ended'] = True
+                    target_process = None
+
+            # Determine order and write
+            if args.format == 'csv':
+                if not header_printed:
+                    keys_order = list(row.keys())
+                    if csv_writer:
+                        write_csv_header(csv_writer, keys_order)
+                    else:
+                        print('#' + ','.join(keys_order))
+                    header_printed = True
+                line_values = [row.get(k,'') for k in keys_order]
+                line = ','.join(str(v) for v in line_values)
+                if file_handle:
+                    file_handle.write(line + '\n')
+                else:
+                    print(line)
+            else:  # jsonl
+                if file_handle:
+                    file_handle.write(json.dumps(row, ensure_ascii=False) + '\n')
+                else:
+                    print(json.dumps(row, ensure_ascii=False))
+
+            if popen and popen.poll() is not None and not target_process:
+                # command finished
+                break
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if file_handle:
+            file_handle.close()
+        if NVML_AVAILABLE:
+            try:
+                nvmlShutdown()
+            except Exception:
+                pass
+
+if __name__ == '__main__':
+    main()
