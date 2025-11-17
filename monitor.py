@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import subprocess
+from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 import psutil
@@ -29,6 +30,8 @@ class RaplDomain:
         try:
             with open(os.path.join(self.path, 'energy_uj'), 'r') as f:
                 return int(f.read().strip())
+        except PermissionError:
+            return None
         except Exception:
             return None
 
@@ -182,7 +185,20 @@ def main():
 
     print('開始: interval=%.3fs format=%s' % (args.interval, args.format))
     if rapl_domains:
-        print('RAPL domains: ' + ', '.join(d.name for d in rapl_domains))
+        # 初期エネルギー値を確認
+        accessible_domains = []
+        for d in rapl_domains:
+            e = d.read_energy_uj()
+            if e is not None:
+                accessible_domains.append(d)
+        
+        if accessible_domains:
+            print('RAPL domains: ' + ', '.join(d.name for d in accessible_domains))
+            rapl_domains = accessible_domains
+        else:
+            print('警告: RAPL domainが検出されましたが、読み取り権限がありません')
+            print('  CPU電力測定にはroot権限が必要です: sudo uv run monitor.py')
+            rapl_domains = []
     if gpu_devices:
         try:
             drv = nvmlSystemGetDriverVersion().decode()
@@ -193,13 +209,20 @@ def main():
         print('pynvml が利用できないため GPU 計測無効')
 
     header_printed = False
+    # Warm-up: sample once to initialize energy counters
+    for d in rapl_domains:
+        d.sample_power_w()
+    
     try:
         while True:
             ts = time.time()
             elapsed = ts - start_time
             if args.duration and elapsed >= args.duration:
                 break
-            row: Dict[str, Any] = {'timestamp': ts}
+            row: Dict[str, Any] = {
+                'timestamp': ts,
+                'datetime': datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            }
 
             # CPU power
             for d in rapl_domains:
