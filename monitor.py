@@ -5,19 +5,33 @@ import argparse
 import csv
 import json
 import subprocess
+import sys
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 import psutil
+from loguru import logger
+
 try:
-    from pynvml import nvmlInit, nvmlShutdown, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex, \
-        nvmlDeviceGetPowerUsage, nvmlDeviceGetName, nvmlDeviceGetUtilizationRates, \
-        nvmlDeviceGetMemoryInfo, nvmlSystemGetDriverVersion, nvmlDeviceGetGraphicsRunningProcesses_v3
+    from pynvml import (
+        nvmlInit,
+        nvmlShutdown,
+        nvmlDeviceGetCount,
+        nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetPowerUsage,
+        nvmlDeviceGetName,
+        nvmlDeviceGetUtilizationRates,
+        nvmlDeviceGetMemoryInfo,
+        nvmlSystemGetDriverVersion,
+        nvmlDeviceGetGraphicsRunningProcesses_v3,
+    )
+
     NVML_AVAILABLE = True
 except Exception:
     NVML_AVAILABLE = False
 
-RAPL_PATH = '/sys/class/powercap'
+RAPL_PATH = "/sys/class/powercap"
+
 
 class RaplDomain:
     def __init__(self, path: str, name: str):
@@ -28,7 +42,7 @@ class RaplDomain:
 
     def read_energy_uj(self) -> Optional[int]:
         try:
-            with open(os.path.join(self.path, 'energy_uj'), 'r') as f:
+            with open(os.path.join(self.path, "energy_uj"), "r") as f:
                 return int(f.read().strip())
         except PermissionError:
             return None
@@ -52,29 +66,32 @@ class RaplDomain:
             return None
         return (delta_e / 1_000_000.0) / delta_t
 
+
 def discover_rapl_domains() -> List[RaplDomain]:
     domains: List[RaplDomain] = []
     if not os.path.isdir(RAPL_PATH):
         return domains
     for entry in os.listdir(RAPL_PATH):
-        if entry.startswith('intel-rapl'):
+        if entry.startswith("intel-rapl"):
             domain_path = os.path.join(RAPL_PATH, entry)
-            name_file = os.path.join(domain_path, 'name')
+            name_file = os.path.join(domain_path, "name")
             name = entry
             if os.path.isfile(name_file):
                 try:
-                    with open(name_file, 'r') as f:
+                    with open(name_file, "r") as f:
                         name = f.read().strip()
                 except Exception:
                     pass
             domains.append(RaplDomain(domain_path, name))
     return domains
 
+
 class GpuDevice:
     def __init__(self, index: int, handle: Any, name: str):
         self.index = index
         self.handle = handle
         self.name = name
+
 
 def init_nvml_devices() -> List[GpuDevice]:
     devices: List[GpuDevice] = []
@@ -85,71 +102,117 @@ def init_nvml_devices() -> List[GpuDevice]:
         count = nvmlDeviceGetCount()
         for i in range(count):
             h = nvmlDeviceGetHandleByIndex(i)
-            name = nvmlDeviceGetName(h).decode('utf-8') if isinstance(nvmlDeviceGetName(h), bytes) else nvmlDeviceGetName(h)
+            name = (
+                nvmlDeviceGetName(h).decode("utf-8")
+                if isinstance(nvmlDeviceGetName(h), bytes)
+                else nvmlDeviceGetName(h)
+            )
             devices.append(GpuDevice(i, h, name))
     except Exception:
         return []
     return devices
 
+
 def sample_gpu_power(dev: GpuDevice) -> Optional[float]:
     try:
-        # milliwatts -> watts
         return nvmlDeviceGetPowerUsage(dev.handle) / 1000.0
     except Exception:
         return None
+
 
 def sample_gpu_util(dev: GpuDevice) -> Dict[str, Any]:
     data: Dict[str, Any] = {}
     try:
         util = nvmlDeviceGetUtilizationRates(dev.handle)
         mem = nvmlDeviceGetMemoryInfo(dev.handle)
-        data['gpu_util_percent'] = util.gpu
-        data['mem_util_percent'] = util.memory
-        data['mem_used_mb'] = mem.used / (1024*1024)
-        data['mem_total_mb'] = mem.total / (1024*1024)
+        data["gpu_util_percent"] = util.gpu
+        data["mem_util_percent"] = util.memory
+        data["mem_used_mb"] = mem.used / (1024 * 1024)
+        data["mem_total_mb"] = mem.total / (1024 * 1024)
         return data
     except Exception:
         return data
 
-def sample_gpu_process_util(dev: GpuDevice, target_pid: int) -> Optional[Dict[str, Any]]:
+
+def sample_gpu_process_util(
+    dev: GpuDevice, target_pid: int
+) -> Optional[Dict[str, Any]]:
     try:
         procs = nvmlDeviceGetGraphicsRunningProcesses_v3(dev.handle)
         for p in procs:
             if p.pid == target_pid:
-                return {
-                    'gpu_proc_mem_used_mb': p.usedGpuMemory / (1024*1024)
-                }
+                return {"gpu_proc_mem_used_mb": p.usedGpuMemory / (1024 * 1024)}
     except Exception:
         return None
     return None
 
+
 def format_row(row: Dict[str, Any], fmt: str) -> str:
-    if fmt == 'jsonl':
+    if fmt == "jsonl":
         return json.dumps(row, ensure_ascii=False)
-    # csv -> we output header separately; here join values
-    return ','.join(str(row.get(k, '')) for k in row.keys())
+    return ",".join(str(row.get(k, "")) for k in row.keys())
+
 
 def write_csv_header(writer: csv.writer, keys: List[str]):
     writer.writerow(keys)
 
+
 def run_command(command: List[str]) -> subprocess.Popen:
     return subprocess.Popen(command)
 
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description='Intel CPU (RAPL) + NVIDIA GPU 電力・性能モニタ')
-    p.add_argument('--interval', type=float, default=1.0, help='サンプリング間隔(秒)')
-    p.add_argument('--duration', type=float, default=0.0, help='総測定時間(秒, 0=無限)')
-    p.add_argument('--output', type=str, default='', help='出力ファイルパス(空なら標準出力)')
-    p.add_argument('--format', choices=['csv','jsonl'], default='csv', help='出力フォーマット')
-    p.add_argument('--command', type=str, nargs=argparse.REMAINDER, help='監視しながら実行する外部コマンド ("--" の後に記述)')
-    p.add_argument('--pid', type=int, default=0, help='既存プロセスPIDを監視 (command未指定時)')
-    p.add_argument('--no-gpu', action='store_true', help='GPU計測を無効化')
-    p.add_argument('--no-cpu', action='store_true', help='CPU(RAPL)計測を無効化')
+    p = argparse.ArgumentParser(
+        description="Intel CPU (RAPL) + NVIDIA GPU Power Monitor"
+    )
+    p.add_argument(
+        "--interval", type=float, default=1.0, help="Sampling interval in seconds"
+    )
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=0.0,
+        help="Total monitoring duration in seconds (0=infinite)",
+    )
+    p.add_argument(
+        "--output", type=str, default="", help="Output file path (empty for stdout)"
+    )
+    p.add_argument(
+        "--format", choices=["csv", "jsonl"], default="csv", help="Output format"
+    )
+    p.add_argument(
+        "--command",
+        type=str,
+        nargs=argparse.REMAINDER,
+        help='External command to run while monitoring (specify after "--")',
+    )
+    p.add_argument(
+        "--pid",
+        type=int,
+        default=0,
+        help="Monitor existing process PID (when command is not specified)",
+    )
+    p.add_argument("--no-gpu", action="store_true", help="Disable GPU monitoring")
+    p.add_argument(
+        "--no-cpu", action="store_true", help="Disable CPU (RAPL) monitoring"
+    )
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
+        help="Log level",
+    )
     return p
+
 
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    # Logger setup
+    logger.remove()
+    logger.add(sys.stderr, level=args.log_level, enqueue=True, colorize=True)
+    logger.info("Start interval={:.3f}s format={}", args.interval, args.format)
 
     rapl_domains = discover_rapl_domains() if not args.no_cpu else []
     gpu_devices = init_nvml_devices() if (not args.no_gpu and NVML_AVAILABLE) else []
@@ -159,10 +222,10 @@ def main():
     if args.command:
         # Strip leading -- if present in REMAINDER
         cmd = args.command
-        if cmd and cmd[0] == '--':
+        if cmd and cmd[0] == "--":
             cmd = cmd[1:]
         if not cmd:
-            print('外部コマンドが指定されていません')
+            logger.error("External command is not specified")
             return
         popen = run_command(cmd)
         target_process = psutil.Process(popen.pid)
@@ -170,7 +233,7 @@ def main():
         try:
             target_process = psutil.Process(args.pid)
         except Exception:
-            print(f'PID {args.pid} にアクセスできません')
+            logger.error("Cannot access PID {}", args.pid)
 
     start_time = time.time()
     csv_writer = None
@@ -178,41 +241,43 @@ def main():
     keys_order: List[str] = []
 
     if args.output:
-        mode = 'w'
+        mode = "w"
         file_handle = open(args.output, mode, buffering=1)
-        if args.format == 'csv':
+        if args.format == "csv":
             csv_writer = csv.writer(file_handle)
 
-    print('開始: interval=%.3fs format=%s' % (args.interval, args.format))
     if rapl_domains:
-        # 初期エネルギー値を確認
         accessible_domains = []
         for d in rapl_domains:
             e = d.read_energy_uj()
             if e is not None:
                 accessible_domains.append(d)
-        
         if accessible_domains:
-            print('RAPL domains: ' + ', '.join(d.name for d in accessible_domains))
+            logger.info(
+                "RAPL domains: {}", ", ".join(d.name for d in accessible_domains)
+            )
             rapl_domains = accessible_domains
         else:
-            print('警告: RAPL domainが検出されましたが、読み取り権限がありません')
-            print('  CPU電力測定にはroot権限が必要です: sudo uv run monitor.py')
+            logger.warning("RAPL domain detected but not readable (CPU power requires sudo)")
+            logger.info("Example: sudo uv run monitor.py")
             rapl_domains = []
     if gpu_devices:
         try:
             drv = nvmlSystemGetDriverVersion().decode()
         except Exception:
-            drv = 'unknown'
-        print('NVIDIA GPUs: ' + ', '.join(f'{g.index}:{g.name}' for g in gpu_devices) + f' (driver {drv})')
+            drv = "unknown"
+        logger.info(
+            "NVIDIA GPUs: {} (driver {})",
+            ", ".join(f"{g.index}:{g.name}" for g in gpu_devices),
+            drv,
+        )
     elif not args.no_gpu and not NVML_AVAILABLE:
-        print('pynvml が利用できないため GPU 計測無効')
+        logger.warning("pynvml is not available, GPU monitoring disabled")
 
     header_printed = False
-    # Warm-up: sample once to initialize energy counters
     for d in rapl_domains:
         d.sample_power_w()
-    
+
     try:
         while True:
             ts = time.time()
@@ -220,59 +285,53 @@ def main():
             if args.duration and elapsed >= args.duration:
                 break
             row: Dict[str, Any] = {
-                'timestamp': ts,
-                'datetime': datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                "timestamp": ts,
+                "datetime": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S.%f")[
+                    :-3
+                ],
             }
-
-            # CPU power
             for d in rapl_domains:
                 pw = d.sample_power_w()
                 if pw is not None:
-                    row[f'cpu_{d.name}_power_w'] = round(pw, 3)
-
-            # GPU metrics
+                    row[f"cpu_{d.name}_power_w"] = round(pw, 3)
             for g in gpu_devices:
                 gpw = sample_gpu_power(g)
                 if gpw is not None:
-                    row[f'gpu{g.index}_power_w'] = round(gpw, 1)
+                    row[f"gpu{g.index}_power_w"] = round(gpw, 1)
                 util = sample_gpu_util(g)
-                for k,v in util.items():
-                    row[f'gpu{g.index}_{k}'] = v
+                for k, v in util.items():
+                    row[f"gpu{g.index}_{k}"] = v
                 if target_process:
                     proc_util = sample_gpu_process_util(g, target_process.pid)
                     if proc_util:
-                        for k,v in proc_util.items():
-                            row[f'gpu{g.index}_{k}'] = v
-
-            # Process performance
+                        for k, v in proc_util.items():
+                            row[f"gpu{g.index}_{k}"] = v
             if target_process:
                 try:
-                    cpu_pct = target_process.cpu_percent(interval=None)  # non-blocking, delta since last call
+                    cpu_pct = target_process.cpu_percent(interval=None)
                     mem_info = target_process.memory_info()
-                    row['proc_cpu_percent'] = cpu_pct
-                    row['proc_mem_rss_mb'] = mem_info.rss / (1024*1024)
+                    row["proc_cpu_percent"] = cpu_pct
+                    row["proc_mem_rss_mb"] = mem_info.rss / (1024 * 1024)
                 except Exception:
-                    row['proc_ended'] = True
+                    row["proc_ended"] = True
                     target_process = None
-
-            # Determine order and write
-            if args.format == 'csv':
+            if args.format == "csv":
                 if not header_printed:
                     keys_order = list(row.keys())
                     if csv_writer:
                         write_csv_header(csv_writer, keys_order)
                     else:
-                        print('#' + ','.join(keys_order))
+                        print("#" + ",".join(keys_order))
                     header_printed = True
-                line_values = [row.get(k,'') for k in keys_order]
-                line = ','.join(str(v) for v in line_values)
+                line_values = [row.get(k, "") for k in keys_order]
+                line = ",".join(str(v) for v in line_values)
                 if file_handle:
-                    file_handle.write(line + '\n')
+                    file_handle.write(line + "\n")
                 else:
                     print(line)
             else:  # jsonl
                 if file_handle:
-                    file_handle.write(json.dumps(row, ensure_ascii=False) + '\n')
+                    file_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                 else:
                     print(json.dumps(row, ensure_ascii=False))
 
@@ -292,5 +351,6 @@ def main():
             except Exception:
                 pass
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
