@@ -17,7 +17,7 @@ It can also run external commands while measuring.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install .
 ```
 
 or using uv:
