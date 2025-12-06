@@ -24,6 +24,8 @@ try:
         nvmlDeviceGetMemoryInfo,
         nvmlSystemGetDriverVersion,
         nvmlDeviceGetGraphicsRunningProcesses_v3,
+        nvmlDeviceGetClockInfo,
+        NVML_CLOCK_GRAPHICS,
     )
 
     NVML_AVAILABLE = True
@@ -145,6 +147,14 @@ def sample_gpu_process_util(
     except Exception:
         return None
     return None
+
+
+def sample_gpu_frequency(dev: GpuDevice) -> Optional[int]:
+    try:
+        freq = nvmlDeviceGetClockInfo(dev.handle, NVML_CLOCK_GRAPHICS)
+        return freq
+    except Exception:
+        return None
 
 
 def format_row(row: Dict[str, Any], fmt: str) -> str:
@@ -290,6 +300,11 @@ def main():
                     :-3
                 ],
             }
+            # System-wide CPU metrics
+            row["cpu_usage_percent"] = round(psutil.cpu_percent(interval=None), 1)
+            cpu_freq = psutil.cpu_freq()
+            if cpu_freq is not None:
+                row["cpu_freq_mhz"] = round(cpu_freq.current, 0)
             for d in rapl_domains:
                 pw = d.sample_power_w()
                 if pw is not None:
@@ -301,6 +316,9 @@ def main():
                 util = sample_gpu_util(g)
                 for k, v in util.items():
                     row[f"gpu{g.index}_{k}"] = v
+                gpu_freq = sample_gpu_frequency(g)
+                if gpu_freq is not None:
+                    row[f"gpu{g.index}_freq_mhz"] = gpu_freq
                 if target_process:
                     proc_util = sample_gpu_process_util(g, target_process.pid)
                     if proc_util:
