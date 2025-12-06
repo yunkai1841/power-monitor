@@ -304,7 +304,7 @@ def main():
             row["cpu_usage_percent"] = round(psutil.cpu_percent(interval=None), 1)
             cpu_freq = psutil.cpu_freq()
             if cpu_freq is not None:
-                row["cpu_freq_mhz"] = round(cpu_freq.current, 0)
+                row["cpu_freq_mhz"] = int(round(cpu_freq.current))
             for d in rapl_domains:
                 pw = d.sample_power_w()
                 if pw is not None:
